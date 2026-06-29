@@ -1,0 +1,63 @@
+%% FoundLoc DINOv3 two-tower matcher + seed-once navigation loop.
+%% The core algorithm: coarse retrieval -> fine correlation -> sigma gate -> track update.
+%% Render: paste into https://mermaid.live , VS Code "Markdown Preview Mermaid",
+%%   or  mmdc -i algorithm_flow.mmd -o algorithm_flow.svg
+flowchart TD
+    %% ===================== seed =====================
+    SEED([Takeoff GPS fix - seed the track once]):::seed
+
+    %% ===================== per-frame inputs =====================
+    subgraph INPUTS["Per-frame inputs"]
+        FRAME["Drone frame (orthorectified, 384x384)"]
+        PRIOR["Position prior<br/>seed-GPS propagated by VIO odometry<br/>+ IMU heading (yaw)"]
+        ALT["Altitude AGL -> tile size"]
+    end
+    SEED --> PRIOR
+    PRIOR --> REF["Sample REFERENCE satellite tile<br/>from mbtiles z=19 @ prior, rotated to heading"]
+    ALT --> REF
+
+    %% ===================== shared backbone =====================
+    FRAME --> BB
+    REF --> BB
+    BB{{"Shared DINOv3 ViT-S/16 + LoRA (rank 8, top 4 blocks)<br/>get_intermediate_layers -> patch grids 24x24 + pooled"}}:::model
+
+    %% ===================== COARSE stage =====================
+    subgraph COARSE["COARSE stage - retrieval"]
+        DESCQ["PooledHead -> 128-D desc_q (drone)"]
+        FAISS[("FAISS index of map tile descriptors")]
+        SHORT["Shortlist candidate tiles"]
+        DESCQ --> FAISS --> SHORT
+    end
+    BB --> DESCQ
+
+    %% ===================== FINE stage =====================
+    subgraph FINE["FINE stage - correlation"]
+        CORR["4D correlation volume<br/>C(i,j,k,l) = <Fd[i,j], Fs[k,l]>"]
+        CNN["Factorised 2D CNNs (sat_cnn -> drone_cnn)"]
+        REG["Regressor -> dx, dy, dyaw, logvar_xy, logvar_yaw"]
+        CORR --> CNN --> REG
+    end
+    BB --> CORR
+    SHORT -. chosen tile .-> CORR
+
+    %% ===================== decode + confidence =====================
+    REG --> DEC["DECODE offset_frac, dyaw -> metric (dx,dy,dyaw)"]
+    REG --> SIG["sigma = exp(0.5*logvar) (fraction units, recalibrated)"]
+
+    %% ===================== sigma GATE =====================
+    SIG --> GATE{"sigma < gate?<br/>(e.g. 4 m)"}:::gate
+    DEC --> GATE
+    GATE -->|"yes - trust match"| APPLY["APPLY correction to prior -> position estimate"]
+    GATE -->|"no - abstain"| SKIP["Skip correction (coast on odometry this frame)"]
+
+    %% ===================== navigation loop =====================
+    APPLY --> TRACK["Updated track / pose estimate"]
+    SKIP --> TRACK
+    TRACK -->|"carry forward as next prior"| PRIOR
+    TRACK --> OUT([Geodetic pose output]):::out
+
+    %% ===================== styling =====================
+    classDef seed  fill:#fef7e0,stroke:#f9ab00,color:#000;
+    classDef model fill:#fce8e6,stroke:#ea4335,stroke-width:2px,color:#000;
+    classDef gate  fill:#e8f0fe,stroke:#4285f4,stroke-width:2px,color:#000;
+    classDef out   fill:#e6f4ea,stroke:#34a853,color:#000;
